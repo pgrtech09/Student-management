@@ -3,30 +3,545 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Vidya Campus</title>
-<link rel="stylesheet" href="css/style.css">
-<link rel="manifest" href="manifest.json">
+<title>Student Dashboard | Vidya Campus</title>
+<link rel="stylesheet" href="../css/style.css">
+<link rel="manifest" href="../manifest.json">
 <meta name="theme-color" content="#1B2A4A">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/icons/favicon-32.png">
-<link rel="apple-touch-icon" href="assets/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/icons/favicon-32.png">
 </head>
 <body>
-<div class="login-wrap">
-  <div class="login-badge" style="margin:0 auto;">VC</div>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="mark">VC</div><div class="name">Vidya Campus</div></div>
+    <div class="who">
+      <span class="role-pill">Student</span>
+      <div class="name" id="who-name">—</div>
+      <div class="meta" id="who-meta">—</div>
+    </div>
+    <nav>
+      <div class="nav-item active" data-view="overview">Overview</div>
+      <div class="nav-item" data-view="attendance">Attendance</div>
+      <div class="nav-item" data-view="marks">Marks &amp; Results</div>
+      <div class="nav-item" data-view="timetable">Timetable</div>
+      <div class="nav-item" data-view="leave">Leave Request</div>
+      <div class="nav-item" data-view="events">Events</div>
+      <div class="nav-item" data-view="profile">Profile</div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="logout-link" onclick="logout()">Sign out</div>
+      <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()">🌙</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="main-header">
+      <div>
+        <h1 id="view-title">Overview</h1>
+        <div class="date-sub" id="today-date"></div>
+      </div>
+      <div class="header-actions">
+        <div class="bell-wrap" id="notif-bell">
+          🔔<span class="bell-badge" id="notif-badge" style="display:none;"></span>
+          <div class="notif-panel" id="notif-panel"></div>
+        </div>
+        <button class="btn gold small" id="checkin-btn">📍 I'm here in college</button>
+      </div>
+    </div>
+    <div id="content">Loading...</div>
+  </main>
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="js/config.js"></script>
-<script src="js/app.js"></script>
+<script src="../js/config.js"></script>
+<script src="../js/app.js"></script>
 <script>
-  (async () => {
-    initTheme();
-    const profile = await getSessionProfile();
-    if (profile) {
-      window.location.href = profile.role + '/index.html';
-    } else {
-      window.location.href = 'login.html';
-    }
-  })();
+let profile = null;
+let attendance = [], marks = [], results = [], timetable = [], events = [], registrations = [], leaves = [];
+let currentView = 'overview';
+
+async function init() {
+  initTheme();
+  document.getElementById('theme-toggle-btn').textContent = (document.documentElement.getAttribute('data-theme') === 'dark') ? '☀️' : '🌙';
+  profile = await requireRole('student');
+  if (!profile) return;
+  document.getElementById('who-name').textContent = profile.name;
+  document.getElementById('who-meta').textContent = `${profile.department} · Sec ${profile.section} · Roll ${profile.roll_no}`;
+  document.getElementById('today-date').textContent = new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.addEventListener('click', () => {
+      document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+      item.classList.add('active');
+      currentView = item.dataset.view;
+      document.getElementById('view-title').textContent = item.textContent;
+      render();
+    });
+  });
+
+  await loadAll();
+  initNotificationBell(profile);
+}
+
+async function loadAll() {
+  const [{ data: att }, { data: mk }, { data: res }, { data: tt }, { data: ev }, { data: regs }, { data: lv }] = await Promise.all([
+    supabaseClient.from('attendance').select('*').eq('student_id', profile.id).order('date', { ascending: false }),
+    supabaseClient.from('marks').select('*').eq('student_id', profile.id),
+    supabaseClient.from('semester_results').select('*').eq('student_id', profile.id).order('semester'),
+    supabaseClient.from('timetable').select('*').eq('department', profile.department).eq('section', profile.section).order('day').order('period'),
+    supabaseClient.from('events').select('*').or(`department.eq.${profile.department},department.eq.ALL`).order('created_at', { ascending: false }).limit(30),
+    supabaseClient.from('event_registrations').select('*').eq('student_id', profile.id),
+    supabaseClient.from('leave_requests').select('*').eq('student_id', profile.id).order('created_at', { ascending: false }),
+  ]);
+  attendance = att || []; marks = mk || []; results = res || []; timetable = tt || [];
+  events = ev || []; registrations = regs || []; leaves = lv || [];
+  render();
+}
+
+function render() {
+  const c = document.getElementById('content');
+  if (currentView === 'overview') c.innerHTML = renderOverview();
+  else if (currentView === 'attendance') c.innerHTML = renderAttendance();
+  else if (currentView === 'marks') c.innerHTML = renderMarks();
+  else if (currentView === 'timetable') c.innerHTML = renderTimetable();
+  else if (currentView === 'leave') c.innerHTML = renderLeave();
+  else if (currentView === 'events') c.innerHTML = renderEvents();
+  else if (currentView === 'profile') c.innerHTML = renderProfile();
+  attachDynamicHandlers();
+  if (currentView === 'attendance') {
+    const canvas = document.getElementById('monthly-chart');
+    if (canvas) drawMonthlyChart(canvas);
+  }
+}
+
+function renderOverview() {
+  const stats = attendanceStatsFrom(attendance);
+  const backlogs = marks.filter(m => m.backlog);
+  const todaysDay = new Date().toLocaleDateString('en-IN', { weekday: 'long' });
+  const todaysClasses = timetable.filter(t => t.day === todaysDay);
+  return `
+    <div class="grid cols-4">
+      <div class="card">
+        <h3>Attendance</h3>
+        <div class="flex-between">
+          ${attendanceRingSVG(stats.percentage)}
+          <div class="stat-note">${stats.present} present / ${stats.total} classes<br>${stats.percentage < 75 ? `Need ${stats.neededFor75} more to reach 75%` : 'On track 🎉'}</div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Semester</h3>
+        <div class="big-num">${profile.semester ?? '—'}</div>
+        <div class="stat-note">${profile.year ? `Year ${profile.year}` : ''}</div>
+      </div>
+      <div class="card">
+        <h3>Backlogs</h3>
+        <div class="big-num" style="color:${backlogs.length ? 'var(--absent)' : 'var(--present)'}">${backlogs.length}</div>
+        <div class="stat-note">${backlogs.length ? 'Subjects pending clearance' : 'All clear 🎉'}</div>
+      </div>
+      <div class="card">
+        <h3>Today's Classes</h3>
+        <div class="big-num">${todaysClasses.length}</div>
+        <div class="stat-note">${todaysDay}</div>
+      </div>
+    </div>
+
+    <h2 class="section-title">Today's Timetable</h2>
+    <div class="card">
+      ${todaysClasses.length ? `<table><thead><tr><th>Period</th><th>Time</th><th>Subject</th><th>Faculty</th><th>Room</th></tr></thead><tbody>
+        ${todaysClasses.sort((a,b)=>a.period-b.period).map(t => `<tr><td>${t.period}</td><td>${t.time_slot}</td><td>${t.subject}</td><td class="muted">${t.faculty_name||'—'}</td><td class="muted">${t.room_number||'—'}</td></tr>`).join('')}
+      </tbody></table>` : '<p class="muted">No classes scheduled today.</p>'}
+    </div>
+
+    <h2 class="section-title">Latest News &amp; Events</h2>
+    <div class="card">
+      ${events.slice(0,3).map(eventItemHtml).join('') || '<p class="muted">No updates yet.</p>'}
+    </div>
+  `;
+}
+
+function renderAttendance() {
+  const stats = attendanceStatsFrom(attendance);
+  const missingReasons = attendance.filter(r => r.status === 'absent' && !r.reason);
+
+  // subject-wise breakdown
+  const bySubject = {};
+  attendance.forEach(r => {
+    const key = r.subject_id || 'general';
+    if (!bySubject[key]) bySubject[key] = [];
+    bySubject[key].push(r);
+  });
+
+  return `
+    <div class="grid cols-3">
+      <div class="card">
+        <h3>Overall Attendance</h3>
+        <div class="flex-between">${attendanceRingSVG(stats.percentage)}<div class="stat-note">${stats.percentage}%${stats.percentage < 75 ? `<br>Need ${stats.neededFor75} more classes` : ''}</div></div>
+      </div>
+      <div class="card"><h3>Present / Absent / Leave</h3><div class="big-num" style="font-size:22px;">${stats.present} / ${stats.absent} / ${stats.leave}</div></div>
+      <div class="card"><h3>Semester Attendance</h3>${progressBarHTML(stats.percentage)}<div class="stat-note" style="margin-top:6px;">${stats.percentage}% this semester</div></div>
+    </div>
+
+    <h2 class="section-title">Monthly Attendance Trend</h2>
+    <div class="card"><div class="chart-wrap"><canvas id="monthly-chart" style="width:100%;height:100%;"></canvas></div></div>
+
+    ${missingReasons.length ? `
+    <h2 class="section-title">Absences needing a reason</h2>
+    <div class="card">
+      ${missingReasons.map(r => `
+        <div class="form-row" style="border-bottom:1px solid var(--border);padding-bottom:14px;margin-bottom:14px;">
+          <div style="min-width:120px;"><strong>${fmtDate(r.date)}</strong></div>
+          <div style="flex:1;">
+            <select id="reason-select-${r.date}">
+              <option value="">Select a reason...</option>
+              <option value="Medical / Illness">Medical / Illness</option>
+              <option value="Personal / Family reason">Personal / Family reason</option>
+              <option value="Travel delay">Travel delay</option>
+              <option value="Other">Other</option>
+            </select>
+          </div>
+          <button class="btn small" data-submit-reason="${r.date}">Submit</button>
+        </div>
+      `).join('')}
+    </div>` : ''}
+
+    <h2 class="section-title">Full Log</h2>
+    <div class="card">
+      <table>
+        <thead><tr><th>Date</th><th>Status</th><th>Details</th></tr></thead>
+        <tbody>
+          ${attendance.map(r => `
+            <tr>
+              <td>${fmtDate(r.date)}</td>
+              <td><span class="pill ${r.status}">${r.status}</span></td>
+              <td class="muted">${r.location || r.reason || '—'}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function drawMonthlyChart(canvas) {
+  // group attendance by ISO week for a simple trend line
+  const byWeek = {};
+  attendance.slice().reverse().forEach(r => {
+    const d = new Date(r.date);
+    const week = `W${Math.ceil(d.getDate()/7)} ${d.toLocaleDateString('en-IN',{month:'short'})}`;
+    if (!byWeek[week]) byWeek[week] = { present: 0, total: 0 };
+    byWeek[week].total++;
+    if (r.status === 'present') byWeek[week].present++;
+  });
+  const labels = Object.keys(byWeek);
+  const values = labels.map(k => Math.round((byWeek[k].present / byWeek[k].total) * 100));
+  if (labels.length) drawLineChart(canvas, labels, values);
+}
+
+function renderMarks() {
+  const backlogs = marks.filter(m => m.backlog);
+  const latestResult = results[results.length - 1];
+  return `
+    <div class="grid cols-4">
+      <div class="card"><h3>Subjects</h3><div class="big-num">${marks.length}</div></div>
+      <div class="card"><h3>Backlogs</h3><div class="big-num" style="color:${backlogs.length ? 'var(--absent)' : 'var(--present)'}">${backlogs.length}</div></div>
+      <div class="card"><h3>Current SGPA</h3><div class="big-num">${latestResult?.sgpa ?? '—'}</div></div>
+      <div class="card"><h3>CGPA</h3><div class="big-num">${latestResult?.cgpa ?? '—'}</div></div>
+    </div>
+
+    <h2 class="section-title">Marks — Semester ${profile.semester ?? '—'}</h2>
+    <div class="card">
+      <table>
+        <thead><tr><th>Subject</th><th>Internal 1</th><th>Internal 2</th><th>Assignment</th><th>Lab</th><th>Semester Exam</th><th>Status</th></tr></thead>
+        <tbody>
+          ${marks.map(m => `
+            <tr>
+              <td>${m.subject}</td>
+              <td>${m.internal1 ?? '—'}</td>
+              <td>${m.internal2 ?? '—'}</td>
+              <td>${m.assignment ?? '—'}</td>
+              <td>${m.lab ?? '—'}</td>
+              <td>${m.semester_exam ?? '—'} / ${m.max_marks}</td>
+              <td><span class="pill ${m.backlog ? 'backlog' : 'cleared'}">${m.backlog ? 'Backlog' : 'Cleared'}</span></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="section-title">Result History</h2>
+    <div class="card">
+      <table>
+        <thead><tr><th>Semester</th><th>SGPA</th><th>CGPA</th><th>Credits</th><th>Backlogs</th><th>Result</th></tr></thead>
+        <tbody>
+          ${results.map(r => `
+            <tr>
+              <td>${r.semester}</td><td>${r.sgpa}</td><td>${r.cgpa}</td><td>${r.credits_earned}</td><td>${r.backlogs}</td>
+              <td><span class="pill ${r.status}">${r.status === 'pass' ? 'Pass' : 'Fail'}</span></td>
+            </tr>`).join('') || '<tr><td colspan="6" class="muted">No results published yet.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderTimetable() {
+  const days = ['Monday','Tuesday','Wednesday','Thursday','Friday'];
+  const byDay = {};
+  timetable.forEach(t => { (byDay[t.day] = byDay[t.day] || []).push(t); });
+  const maxPeriods = Math.max(...timetable.map(t => t.period), 0);
+  let rows = '';
+  for (let p = 1; p <= maxPeriods; p++) {
+    const sample = timetable.find(t => t.period === p);
+    rows += `<div class="tt-cell tt-time">${sample ? sample.time_slot : ''}</div>`;
+    days.forEach(day => {
+      const entry = (byDay[day] || []).find(t => t.period === p);
+      rows += `<div class="tt-cell">${entry ? `${entry.subject}<br><span class="muted" style="font-size:10px;">${entry.faculty_name||''} · ${entry.room_number||''}</span>` : '—'}</div>`;
+    });
+  }
+  return `
+    <div class="card">
+      <div class="timetable-grid">
+        <div class="tt-cell tt-head">Time</div>
+        ${days.map(d => `<div class="tt-cell tt-head">${d}</div>`).join('')}
+        ${rows}
+      </div>
+    </div>
+  `;
+}
+
+function renderLeave() {
+  return `
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>New Leave Request</h3>
+        <div class="field">
+          <label>Reason Type</label>
+          <select id="leave-reason-type">
+            <option value="Medical">Medical</option>
+            <option value="Personal">Personal</option>
+            <option value="Emergency">Emergency</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>From Date</label>
+          <input type="date" id="leave-from">
+        </div>
+        <div class="field">
+          <label>To Date</label>
+          <input type="date" id="leave-to">
+        </div>
+        <div class="field">
+          <label>Reason Details</label>
+          <textarea id="leave-text" rows="3" placeholder="Explain your reason..."></textarea>
+        </div>
+        <div class="field">
+          <label>Medical Certificate (optional)</label>
+          <input type="file" id="leave-file" accept="image/*,.pdf">
+        </div>
+        <button class="btn gold" id="submit-leave-btn">Submit Request</button>
+      </div>
+      <div class="card">
+        <h3>Status Guide</h3>
+        <p class="muted" style="font-size:13px;line-height:1.7;">
+          <span class="pill pending">Pending</span> — awaiting your incharge's review.<br><br>
+          <span class="pill approved">Approved</span> — your leave has been granted.<br><br>
+          <span class="pill rejected">Rejected</span> — check remarks from your incharge below.
+        </p>
+      </div>
+    </div>
+
+    <h2 class="section-title">My Leave Requests</h2>
+    <div class="card">
+      <table>
+        <thead><tr><th>Dates</th><th>Type</th><th>Reason</th><th>Status</th><th>Remarks</th></tr></thead>
+        <tbody>
+          ${leaves.map(l => `
+            <tr>
+              <td>${fmtDate(l.from_date)} – ${fmtDate(l.to_date)}</td>
+              <td>${l.reason_type}</td>
+              <td class="muted">${l.reason_text || '—'}</td>
+              <td><span class="pill ${l.status.toLowerCase()}">${l.status}</span></td>
+              <td class="muted">${l.remarks || '—'}</td>
+            </tr>`).join('') || '<tr><td colspan="5" class="muted">No leave requests yet.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderEvents() {
+  return `<div class="card">${events.map(eventItemHtml).join('') || '<p class="muted">No updates yet.</p>'}</div>`;
+}
+
+function eventItemHtml(e) {
+  const isRegistered = registrations.some(r => r.event_id === e.id);
+  return `
+    <div class="event-item">
+      <div class="event-type">${e.type}</div>
+      <h4>${e.title}</h4>
+      <p>${e.description || ''}</p>
+      ${e.venue ? `<p class="muted" style="font-size:12px;">📍 ${e.venue} ${e.event_date ? '· ' + fmtDate(e.event_date) : ''} ${e.event_time || ''}</p>` : ''}
+      <div class="event-date">Posted ${timeAgo(e.created_at)}</div>
+      ${e.type === 'event' ? `
+        <div class="event-actions">
+          ${isRegistered
+            ? `<span class="pill approved">✓ Registered</span>`
+            : `<button class="btn small outline" data-register-event="${e.id}">Register</button>`}
+          ${e.poster_url ? `<a href="${e.poster_url}" target="_blank" class="btn small outline" style="margin-left:8px;">Download Poster</a>` : ''}
+        </div>` : ''}
+    </div>`;
+}
+
+function renderProfile() {
+  return `
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>Update Profile Photo</h3>
+        <img id="profile-photo-preview" src="${profile.profile_photo_url || ''}" style="width:100px;height:100px;border-radius:50%;object-fit:cover;background:var(--parchment);display:${profile.profile_photo_url ? 'block' : 'none'};margin-bottom:12px;">
+        <input type="file" id="photo-upload" accept="image/*">
+        <button class="btn small gold" id="upload-photo-btn" style="margin-top:10px;width:auto;">Upload Photo</button>
+      </div>
+      <div class="card">
+        <h3>Change Password</h3>
+        <div class="field"><label>New Password</label><input type="password" id="new-password" placeholder="At least 6 characters"></div>
+        <button class="btn small gold" id="change-password-btn" style="width:auto;">Update Password</button>
+      </div>
+    </div>
+
+    <h2 class="section-title">Student Details</h2>
+    <div class="card">
+      <div class="grid cols-2">
+        <div><label class="muted" style="font-size:12px;">Full Name</label><div>${profile.name}</div></div>
+        <div><label class="muted" style="font-size:12px;">Roll Number</label><div class="mono">${profile.roll_no}</div></div>
+        <div><label class="muted" style="font-size:12px;">Department</label><div>${profile.department}</div></div>
+        <div><label class="muted" style="font-size:12px;">Section</label><div>${profile.section}</div></div>
+        <div><label class="muted" style="font-size:12px;">Semester</label><div>${profile.semester ?? '—'}</div></div>
+        <div><label class="muted" style="font-size:12px;">Phone</label><div>${profile.phone ?? '—'}</div></div>
+        <div><label class="muted" style="font-size:12px;">Email</label><div>${profile.email}</div></div>
+        <div><label class="muted" style="font-size:12px;">Blood Group</label><div>${profile.blood_group ?? '—'}</div></div>
+        <div><label class="muted" style="font-size:12px;">Parent Name</label><div>${profile.parent_name ?? '—'}</div></div>
+        <div><label class="muted" style="font-size:12px;">Parent Phone</label><div>${profile.parent_phone ?? '—'}</div></div>
+      </div>
+      <button class="btn small outline" id="edit-profile-btn" style="width:auto;margin-top:16px;">Edit Profile</button>
+    </div>
+    <div id="edit-profile-form"></div>
+  `;
+}
+
+function attachDynamicHandlers() {
+  document.querySelectorAll('[data-submit-reason]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const date = btn.dataset.submitReason;
+      const select = document.getElementById(`reason-select-${date}`);
+      if (!select.value) { toast('⚠️ Missing reason', 'Please select a reason first.'); return; }
+      try {
+        const { error } = await supabaseClient.from('attendance')
+          .update({ reason: select.value }).eq('student_id', profile.id).eq('date', date);
+        if (error) throw new Error(error.message);
+        toast('✅ Submitted', `Reason recorded for ${fmtDate(date)}`);
+        await loadAll();
+      } catch (e) { toast('❌ Error', e.message); }
+    });
+  });
+
+  const submitLeaveBtn = document.getElementById('submit-leave-btn');
+  if (submitLeaveBtn) submitLeaveBtn.addEventListener('click', async () => {
+    const reason_type = document.getElementById('leave-reason-type').value;
+    const from_date = document.getElementById('leave-from').value;
+    const to_date = document.getElementById('leave-to').value;
+    const reason_text = document.getElementById('leave-text').value.trim();
+    const file = document.getElementById('leave-file').files[0];
+    if (!from_date || !to_date) { toast('⚠️ Missing dates', 'Please select from and to dates.'); return; }
+    submitLeaveBtn.disabled = true; submitLeaveBtn.textContent = 'Submitting...';
+    try {
+      let certificate_url = null;
+      if (file) {
+        const path = `${profile.id}/${Date.now()}_${file.name}`;
+        const { error: upErr } = await supabaseClient.storage.from('medical-certificates').upload(path, file);
+        if (upErr) throw new Error('File upload failed: ' + upErr.message);
+        certificate_url = path;
+      }
+      const { error } = await supabaseClient.from('leave_requests').insert({
+        student_id: profile.id, reason_type, reason_text, from_date, to_date, certificate_url,
+      });
+      if (error) throw new Error(error.message);
+      toast('✅ Submitted', 'Your leave request has been sent to your incharge.');
+      await loadAll();
+    } catch (e) { toast('❌ Error', e.message); }
+    submitLeaveBtn.disabled = false; submitLeaveBtn.textContent = 'Submit Request';
+  });
+
+  document.querySelectorAll('[data-register-event]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const event_id = btn.dataset.registerEvent;
+      try {
+        const { error } = await supabaseClient.from('event_registrations').insert({ event_id, student_id: profile.id });
+        if (error) throw new Error(error.message);
+        toast('✅ Registered', 'You are registered for this event.');
+        await loadAll();
+      } catch (e) { toast('❌ Error', e.message); }
+    });
+  });
+
+  const uploadPhotoBtn = document.getElementById('upload-photo-btn');
+  if (uploadPhotoBtn) uploadPhotoBtn.addEventListener('click', async () => {
+    const file = document.getElementById('photo-upload').files[0];
+    if (!file) { toast('⚠️ No file', 'Choose a photo first.'); return; }
+    uploadPhotoBtn.disabled = true; uploadPhotoBtn.textContent = 'Uploading...';
+    try {
+      const path = `${profile.id}/photo_${Date.now()}_${file.name}`;
+      const { error: upErr } = await supabaseClient.storage.from('profile-photos').upload(path, file);
+      if (upErr) throw new Error(upErr.message);
+      const { data: urlData } = supabaseClient.storage.from('profile-photos').getPublicUrl(path);
+      const { error: profErr } = await supabaseClient.from('profiles').update({ profile_photo_url: urlData.publicUrl }).eq('id', profile.id);
+      if (profErr) throw new Error(profErr.message);
+      profile.profile_photo_url = urlData.publicUrl;
+      toast('✅ Photo updated', 'Your profile photo has been updated.');
+      render();
+    } catch (e) { toast('❌ Error', e.message); }
+    uploadPhotoBtn.disabled = false; uploadPhotoBtn.textContent = 'Upload Photo';
+  });
+
+  const changePwBtn = document.getElementById('change-password-btn');
+  if (changePwBtn) changePwBtn.addEventListener('click', async () => {
+    const newPw = document.getElementById('new-password').value;
+    if (!newPw || newPw.length < 6) { toast('⚠️ Too short', 'Password must be at least 6 characters.'); return; }
+    try {
+      const { error } = await supabaseClient.auth.updateUser({ password: newPw });
+      if (error) throw new Error(error.message);
+      toast('✅ Password updated', 'Use your new password next time you log in.');
+      document.getElementById('new-password').value = '';
+    } catch (e) { toast('❌ Error', e.message); }
+  });
+}
+
+document.getElementById('checkin-btn').addEventListener('click', () => {
+  const btn = document.getElementById('checkin-btn');
+  btn.disabled = true; btn.textContent = 'Getting location...';
+  const done = async (lat, lng, label) => {
+    try {
+      const date = new Date().toISOString().split('T')[0];
+      const location = label || (lat && lng ? `${lat.toFixed(5)}, ${lng.toFixed(5)}` : 'On Campus');
+      const { error: e1 } = await supabaseClient.from('attendance')
+        .upsert({ student_id: profile.id, date, status: 'present', marked_by: 'checkin', location, subject_id: null }, { onConflict: 'student_id,date,subject_id' });
+      if (e1) throw new Error(e1.message);
+      const { error: e2 } = await supabaseClient.from('location_checkins')
+        .upsert({ student_id: profile.id, date, latitude: lat, longitude: lng }, { onConflict: 'student_id,date' });
+      if (e2) console.warn(e2.message);
+      toast('📍 Checked In Successfully', location);
+      await loadAll();
+    } catch (e) { toast('❌ Error', e.message); }
+    btn.disabled = false; btn.textContent = "📍 I'm here in college";
+  };
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      pos => done(pos.coords.latitude, pos.coords.longitude, null),
+      () => done(null, null, 'On Campus (location unavailable)')
+    );
+  } else {
+    done(null, null, 'On Campus');
+  }
+});
+
+init();
 </script>
 </body>
 </html>
