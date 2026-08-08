@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vidya Campus | Sign in</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1B2A4A">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/icons/favicon-32.png">
+<link rel="apple-touch-icon" href="assets/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Vidya Campus">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-badge">VC</div>
+    <h1>Vidya Campus</h1>
+    <p class="sub">Student Management System — sign in to continue</p>
+
+    <form id="login-form">
+      <div class="field">
+        <label>Roll Number / Employee ID / Email</label>
+        <input type="text" id="identifier" required placeholder="e.g. CSEA001 or EMP002" autocomplete="username" />
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" id="password" required placeholder="••••••••" autocomplete="current-password" />
+        <span class="toggle-pw" id="toggle-pw">SHOW</span>
+      </div>
+      <div class="field-row-inline">
+        <label><input type="checkbox" id="remember-me"> Remember me</label>
+        <a id="forgot-link">Forgot password?</a>
+      </div>
+      <button class="btn gold" type="submit" id="login-btn">Sign in</button>
+      <div class="error-msg" id="error-msg"></div>
+      <div class="success-msg" id="success-msg"></div>
+    </form>
+
+    <button class="btn outline small" id="install-btn" style="display:none;width:100%;margin-top:14px;">📲 Install App</button>
+
+    <div class="demo-creds">
+      Demo login &mdash; password123 for all accounts:<br>
+      Employee ID <strong>EMP001</strong> (HOD) &middot; <strong>EMP002</strong> (Incharge A)<br>
+      Roll No <strong>CSEA001</strong> (Student)
+    </div>
+    <div class="demo-creds" style="border-top:none;padding-top:0;margin-top:12px;">
+      New student? <a href="register.html" style="color:var(--ink);font-weight:600;">Register here</a>
+    </div>
+  </div>
+</div>
+
+<!-- Forgot password modal (simple inline overlay, no separate page needed) -->
+<div id="forgot-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center;">
+  <div class="login-card" style="max-width:360px;">
+    <h1 style="font-size:20px;">Reset Password</h1>
+    <p class="sub">Enter your Roll Number / Employee ID / Email and we'll send a reset link.</p>
+    <div class="field">
+      <label>Roll Number / Employee ID / Email</label>
+      <input type="text" id="forgot-identifier" placeholder="e.g. CSEA001" />
+    </div>
+    <button class="btn gold" id="forgot-submit-btn">Send reset link</button>
+    <button class="btn outline small" id="forgot-cancel-btn" style="margin-top:10px;">Cancel</button>
+    <div class="error-msg" id="forgot-error"></div>
+    <div class="success-msg" id="forgot-success"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="js/config.js"></script>
+<script src="js/app.js"></script>
+<script>
+  initTheme();
+
+  (async () => {
+    const existing = await getSessionProfile();
+    if (existing) window.location.href = existing.role + '/index.html';
+  })();
+
+  // Remember me: prefill last-used identifier
+  const savedId = localStorage.getItem('sms_remember_identifier');
+  if (savedId) {
+    document.getElementById('identifier').value = savedId;
+    document.getElementById('remember-me').checked = true;
+  }
+
+  document.getElementById('toggle-pw').addEventListener('click', () => {
+    const pw = document.getElementById('password');
+    const btn = document.getElementById('toggle-pw');
+    if (pw.type === 'password') { pw.type = 'text'; btn.textContent = 'HIDE'; }
+    else { pw.type = 'password'; btn.textContent = 'SHOW'; }
+  });
+
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const identifier = document.getElementById('identifier').value.trim();
+    const password = document.getElementById('password').value;
+    const errorEl = document.getElementById('error-msg');
+    const btn = document.getElementById('login-btn');
+    errorEl.textContent = '';
+    btn.disabled = true;
+    btn.textContent = 'Signing in...';
+    try {
+      const profile = await loginUser(identifier, password);
+      if (document.getElementById('remember-me').checked) {
+        localStorage.setItem('sms_remember_identifier', identifier);
+      } else {
+        localStorage.removeItem('sms_remember_identifier');
+      }
+      window.location.href = profile.role + '/index.html';
+    } catch (err) {
+      errorEl.textContent = err.message;
+      btn.disabled = false;
+      btn.textContent = 'Sign in';
+    }
+  });
+
+  // Forgot password modal
+  const forgotModal = document.getElementById('forgot-modal');
+  document.getElementById('forgot-link').addEventListener('click', () => { forgotModal.style.display = 'flex'; });
+  document.getElementById('forgot-cancel-btn').addEventListener('click', () => { forgotModal.style.display = 'none'; });
+  document.getElementById('forgot-submit-btn').addEventListener('click', async () => {
+    const id = document.getElementById('forgot-identifier').value.trim();
+    const errEl = document.getElementById('forgot-error');
+    const okEl = document.getElementById('forgot-success');
+    errEl.textContent = ''; okEl.textContent = '';
+    if (!id) { errEl.textContent = 'Please enter your Roll Number / Employee ID / Email.'; return; }
+    try {
+      const email = await requestPasswordReset(id);
+      okEl.textContent = `Reset link sent to ${email}. Check your inbox.`;
+    } catch (err) {
+      errEl.textContent = err.message;
+    }
+  });
+
+  // PWA install prompt
+  let deferredInstallPrompt = null;
+  const installBtn = document.getElementById('install-btn');
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    installBtn.style.display = 'block';
+  });
+  installBtn.addEventListener('click', async () => {
+    if (!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    installBtn.style.display = 'none';
+  });
+  window.addEventListener('appinstalled', () => { installBtn.style.display = 'none'; });
+</script>
+</body>
+</html>
