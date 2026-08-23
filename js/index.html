@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HOD Dashboard | Vidya Campus</title>
+<link rel="stylesheet" href="../css/style.css">
+<link rel="manifest" href="../manifest.json">
+<meta name="theme-color" content="#1B2A4A">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/icons/favicon-32.png">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="mark">VC</div><div class="name">Vidya Campus</div></div>
+    <div class="who">
+      <span class="role-pill">HOD</span>
+      <div class="name" id="who-name">—</div>
+      <div class="meta" id="who-meta">—</div>
+    </div>
+    <nav>
+      <div class="nav-item active" data-view="overview">Dashboard</div>
+      <div class="nav-item" data-view="students">Manage Students</div>
+      <div class="nav-item" data-view="faculty">Manage Faculty</div>
+      <div class="nav-item" data-view="timetable">Manage Timetable</div>
+      <div class="nav-item" data-view="subjects">Manage Subjects</div>
+      <div class="nav-item" data-view="publish">Publish Notices</div>
+      <div class="nav-item" data-view="presence">Live Presence</div>
+      <div class="nav-item" data-view="reports">Reports</div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="logout-link" onclick="logout()">Sign out</div>
+      <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()">🌙</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="main-header">
+      <div>
+        <h1 id="view-title">Dashboard</h1>
+        <div class="date-sub" id="today-date"></div>
+      </div>
+      <div class="header-actions">
+        <div class="bell-wrap" id="notif-bell">
+          🔔<span class="bell-badge" id="notif-badge" style="display:none;"></span>
+          <div class="notif-panel" id="notif-panel"></div>
+        </div>
+      </div>
+    </div>
+    <div id="content">Loading...</div>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="../js/config.js"></script>
+<script src="../js/app.js"></script>
+<script>
+let profile = null;
+let students = [];
+let incharges = [];
+let faculty = [];
+let subjects = [];
+let timetable = [];
+let attendanceByStudent = {};
+let marksByStudent = {};
+let events = [];
+let currentView = 'overview';
+let selectedStudentId = null;
+let searchTerm = '';
+let presenceByStudent = {};
+let presenceChannel = null;
+
+async function init() {
+  initTheme();
+  document.getElementById('theme-toggle-btn').textContent = (document.documentElement.getAttribute('data-theme') === 'dark') ? '☀️' : '🌙';
+  profile = await requireRole('hod');
+  if (!profile) return;
+  document.getElementById('who-name').textContent = profile.name;
+  document.getElementById('who-meta').textContent = profile.department;
+  document.getElementById('today-date').textContent = new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.addEventListener('click', () => {
+      document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+      item.classList.add('active');
+      currentView = item.dataset.view;
+      selectedStudentId = null;
+      document.getElementById('view-title').textContent = item.textContent;
+      renderView();
+    });
+  });
+
+  await loadAll();
+  initNotificationBell(profile, loadAll);
+
+  // Live campus presence — refresh whenever any student's location changes
+  presenceChannel = subscribeToPresence(profile, async () => {
+    presenceByStudent = await fetchPresenceMap(students.map(s => s.id));
+    if (currentView === 'presence') renderView();
+  });
+}
+
+async function loadAll() {
+  const [{ data: st }, { data: inc }, { data: fac }, { data: subj }, { data: tt }, { data: ev }] = await Promise.all([
+    supabaseClient.from('profiles').select('*').eq('role', 'student').eq('department', profile.department).order('section').order('roll_no'),
+    supabaseClient.from('profiles').select('*').eq('role', 'incharge').eq('department', profile.department),
+    supabaseClient.from('faculty').select('*').eq('department', profile.department),
+    supabaseClient.from('subjects').select('*').eq('department', profile.department),
+    supabaseClient.from('timetable').select('*').eq('department', profile.department).order('section').order('day').order('period'),
+    supabaseClient.from('events').select('*').or(`department.eq.${profile.department},department.eq.ALL`).order('created_at', { ascending: false }).limit(30),
+  ]);
+  students = st || []; incharges = inc || []; faculty = fac || []; subjects = subj || []; timetable = tt || []; events = ev || [];
+
+  const studentIds = students.map(s => s.id);
+  const safeIds = studentIds.length ? studentIds : ['00000000-0000-0000-0000-000000000000'];
+  const [{ data: att }, { data: mk }, presenceMap] = await Promise.all([
+    supabaseClient.from('attendance').select('*').in('student_id', safeIds),
+    supabaseClient.from('marks').select('*').in('student_id', safeIds),
+    fetchPresenceMap(studentIds),
+  ]);
+  attendanceByStudent = {};
+  (att || []).forEach(r => { (attendanceByStudent[r.student_id] = attendanceByStudent[r.student_id] || []).push(r); });
+  marksByStudent = {};
+  (mk || []).forEach(m => { (marksByStudent[m.student_id] = marksByStudent[m.student_id] || []).push(m); });
+  presenceByStudent = presenceMap;
+
+  renderView();
+}
+
+function statsFor(studentId) { return attendanceStatsFrom(attendanceByStudent[studentId] || []); }
+
+async function renderView() {
+  const c = document.getElementById('content');
+  if (currentView === 'overview') c.innerHTML = renderOverview();
+  else if (currentView === 'students') c.innerHTML = selectedStudentId ? await renderStudentDetail(selectedStudentId) : renderManageStudents();
+  else if (currentView === 'faculty') c.innerHTML = renderManageFaculty();
+  else if (currentView === 'timetable') c.innerHTML = renderManageTimetable();
+  else if (currentView === 'subjects') c.innerHTML = renderManageSubjects();
+  else if (currentView === 'publish') c.innerHTML = renderPublish();
+  else if (currentView === 'presence') c.innerHTML = renderPresence();
+  else if (currentView === 'reports') c.innerHTML = renderReports();
+  attachHandlers();
+}
+
+function renderOverview() {
+  const withStats = students.map(s => ({ ...s, attendance: statsFor(s.id), marks: marksByStudent[s.id] || [] }));
+  const avgAttendance = withStats.length ? Math.round(withStats.reduce((a,b)=>a+b.attendance.percentage,0)/withStats.length) : 0;
+  const passCount = withStats.filter(s => !s.marks.some(m => m.backlog)).length;
+  const passPct = withStats.length ? Math.round((passCount/withStats.length)*100) : 0;
+  const totalBacklogs = withStats.reduce((a,s) => a + s.marks.filter(m=>m.backlog).length, 0);
+  const sections = {};
+  withStats.forEach(s => { (sections[s.section] = sections[s.section] || []).push(s); });
+
+  return `
+    <div class="grid cols-4">
+      <div class="card"><h3>Total Students</h3><div class="big-num">${students.length}</div></div>
+      <div class="card"><h3>Total Faculty</h3><div class="big-num">${faculty.length}</div></div>
+      <div class="card"><h3>Attendance Average</h3><div class="big-num">${avgAttendance}%</div></div>
+      <div class="card"><h3>Pass Percentage</h3><div class="big-num">${passPct}%</div></div>
+    </div>
+    <div class="grid cols-2" style="margin-top:18px;">
+      <div class="card"><h3>Total Backlogs</h3><div class="big-num" style="color:${totalBacklogs?'var(--absent)':'var(--present)'}">${totalBacklogs}</div></div>
+      <div class="card"><h3>Sections</h3><div class="big-num">${Object.keys(sections).length}</div></div>
+    </div>
+
+    <h2 class="section-title">Department Statistics by Section</h2>
+    <div class="card"><div class="chart-wrap"><canvas id="dept-chart" style="width:100%;height:100%;"></canvas></div></div>
+
+    <h2 class="section-title">Upcoming Events</h2>
+    <div class="card">${events.filter(e=>e.type==='event').slice(0,3).map(eventItemSimple).join('') || '<p class="muted">No upcoming events.</p>'}</div>
+  `;
+}
+
+function renderManageStudents() {
+  const withStats = students.map(s => ({ ...s, attendance: statsFor(s.id) }));
+  const filtered = searchTerm ? withStats.filter(s => s.name.toLowerCase().includes(searchTerm.toLowerCase()) || s.roll_no?.toLowerCase().includes(searchTerm.toLowerCase())) : withStats;
+  return `
+    <div class="card">
+      <div class="form-row"><input type="text" class="search-input" id="student-search" placeholder="Search students..." value="${searchTerm}"></div>
+      <table>
+        <thead><tr><th>Roll No</th><th>Name</th><th>Section</th><th>Attendance</th><th></th></tr></thead>
+        <tbody>
+          ${filtered.map(st => `
+            <tr>
+              <td class="mono">${st.roll_no}</td><td>${st.name}</td><td>${st.section}</td>
+              <td><span class="pill ${st.attendance.percentage>=75?'present':'absent'}">${st.attendance.percentage}%</span></td>
+              <td>
+                <button class="btn small outline" data-view-student="${st.id}">View</button>
+                <button class="btn small danger" data-delete-student="${st.id}">Delete</button>
+              </td>
+            </tr>`).join('') || '<tr><td colspan="5" class="muted">No students found.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function renderStudentDetail(studentId) {
+  const student = students.find(s => s.id === studentId);
+  const marks = marksByStudent[studentId] || [];
+  const stats = statsFor(studentId);
+  const recent = (attendanceByStudent[studentId] || []).slice().sort((a,b)=>b.date.localeCompare(a.date)).slice(0,14);
+  return `
+    <button class="btn small outline" data-back="1" style="width:auto;margin-bottom:20px;">← Back to student list</button>
+    <div class="grid cols-4">
+      <div class="card"><h3>Roll No</h3><div class="big-num" style="font-size:20px;">${student.roll_no}</div></div>
+      <div class="card"><h3>Section</h3><div class="big-num" style="font-size:20px;">${student.section}</div></div>
+      <div class="card"><h3>Attendance</h3><div class="flex-between">${attendanceRingSVG(stats.percentage, 60)}</div></div>
+      <div class="card"><h3>Backlogs</h3><div class="big-num" style="color:${marks.filter(m=>m.backlog).length?'var(--absent)':'var(--present)'}">${marks.filter(m=>m.backlog).length}</div></div>
+    </div>
+    <h2 class="section-title">Marks (all semesters)</h2>
+    <div class="card"><table><thead><tr><th>Semester</th><th>Subject</th><th>Marks</th><th>Status</th></tr></thead>
+    <tbody>${marks.slice().sort((a,b)=>b.semester-a.semester).map(m => `<tr><td>${m.semester}</td><td>${m.subject}</td><td>${m.semester_exam??'—'}/${m.max_marks}</td><td><span class="pill ${m.backlog?'backlog':'cleared'}">${m.backlog?'Backlog':'Cleared'}</span></td></tr>`).join('') || '<tr><td colspan="4" class="muted">No marks yet.</td></tr>'}</tbody></table></div>
+    <h2 class="section-title">Recent Attendance</h2>
+    <div class="card"><table><thead><tr><th>Date</th><th>Status</th></tr></thead>
+    <tbody>${recent.map(r => `<tr><td>${fmtDate(r.date)}</td><td><span class="pill ${r.status}">${r.status}</span></td></tr>`).join('')}</tbody></table></div>
+  `;
+}
+
+function renderManageFaculty() {
+  return `
+    <div class="card">
+      <h3>Add Faculty / Incharge</h3>
+      <div class="grid cols-2">
+        <div class="field"><label>Name</label><input type="text" id="fac-name"></div>
+        <div class="field"><label>Employee ID</label><input type="text" id="fac-empid"></div>
+        <div class="field"><label>Designation</label><input type="text" id="fac-designation" placeholder="Assistant Professor"></div>
+        <div class="field"><label>Phone</label><input type="text" id="fac-phone"></div>
+        <div class="field"><label>Email</label><input type="email" id="fac-email"></div>
+      </div>
+      <button class="btn gold small" id="add-faculty-btn" style="width:auto;">Add Faculty</button>
+      <p class="stat-note" style="margin-top:8px;">Note: this adds a faculty record for reports. To create an actual Incharge login, add the user in Supabase Authentication first, then link their profile via SQL Editor (see README).</p>
+    </div>
+    <h2 class="section-title">Faculty List</h2>
+    <div class="card">
+      <table><thead><tr><th>Employee ID</th><th>Name</th><th>Designation</th><th>Phone</th><th></th></tr></thead>
+      <tbody>${faculty.map(f => `<tr><td class="mono">${f.employee_id}</td><td>${f.name}</td><td>${f.designation||'—'}</td><td>${f.phone||'—'}</td><td><button class="btn small danger" data-delete-faculty="${f.id}">Delete</button></td></tr>`).join('')}</tbody></table>
+    </div>
+    <h2 class="section-title">Class Incharges</h2>
+    <div class="card">
+      <table><thead><tr><th>Name</th><th>Section</th><th>Employee ID</th></tr></thead>
+      <tbody>${incharges.map(i => `<tr><td>${i.name}</td><td>Section ${i.section}</td><td class="mono">${i.employee_id||'—'}</td></tr>`).join('')}</tbody></table>
+    </div>
+  `;
+}
+
+function renderManageTimetable() {
+  const sections = [...new Set(students.map(s=>s.section))].sort();
+  return `
+    <div class="card">
+      <h3>Add Timetable Entry</h3>
+      <div class="grid cols-3">
+        <div class="field"><label>Section</label><select id="tt-section">${sections.map(s=>`<option>${s}</option>`).join('')}</select></div>
+        <div class="field"><label>Day</label><select id="tt-day">${['Monday','Tuesday','Wednesday','Thursday','Friday'].map(d=>`<option>${d}</option>`).join('')}</select></div>
+        <div class="field"><label>Period</label><input type="number" id="tt-period" min="1" max="8" value="1"></div>
+        <div class="field"><label>Time Slot</label><input type="text" id="tt-time" placeholder="9:00 - 10:00"></div>
+        <div class="field"><label>Subject</label><input type="text" id="tt-subject"></div>
+        <div class="field"><label>Faculty</label><input type="text" id="tt-faculty"></div>
+        <div class="field"><label>Room</label><input type="text" id="tt-room"></div>
+      </div>
+      <button class="btn gold small" id="add-timetable-btn" style="width:auto;">Add Entry</button>
+    </div>
+    <h2 class="section-title">Current Timetable</h2>
+    <div class="card">
+      <table><thead><tr><th>Section</th><th>Day</th><th>Period</th><th>Time</th><th>Subject</th><th>Faculty</th><th>Room</th><th></th></tr></thead>
+      <tbody>${timetable.map(t => `<tr><td>${t.section}</td><td>${t.day}</td><td>${t.period}</td><td>${t.time_slot}</td><td>${t.subject}</td><td class="muted">${t.faculty_name||'—'}</td><td class="muted">${t.room_number||'—'}</td><td><button class="btn small danger" data-delete-tt="${t.id}">Delete</button></td></tr>`).join('')}</tbody></table>
+    </div>
+  `;
+}
+
+function renderManageSubjects() {
+  return `
+    <div class="card">
+      <h3>Add Subject</h3>
+      <div class="grid cols-2">
+        <div class="field"><label>Code</label><input type="text" id="subj-code" placeholder="CS301"></div>
+        <div class="field"><label>Name</label><input type="text" id="subj-name"></div>
+        <div class="field"><label>Semester</label><input type="number" id="subj-sem" min="1" max="8" value="3"></div>
+        <div class="field"><label>Faculty</label><input type="text" id="subj-faculty"></div>
+        <div class="field"><label>Credits</label><input type="number" id="subj-credits" value="3"></div>
+      </div>
+      <button class="btn gold small" id="add-subject-btn" style="width:auto;">Add Subject</button>
+    </div>
+    <h2 class="section-title">Subjects</h2>
+    <div class="card">
+      <table><thead><tr><th>Code</th><th>Name</th><th>Semester</th><th>Faculty</th><th>Credits</th><th></th></tr></thead>
+      <tbody>${subjects.map(s => `<tr><td class="mono">${s.code}</td><td>${s.name}</td><td>${s.semester}</td><td class="muted">${s.faculty_name||'—'}</td><td>${s.credits}</td><td><button class="btn small danger" data-delete-subject="${s.id}">Delete</button></td></tr>`).join('')}</tbody></table>
+    </div>
+  `;
+}
+
+function renderPublish() {
+  return `
+    <div class="card" style="max-width:600px;">
+      <div class="field">
+        <label>Type</label>
+        <select id="event-type">
+          <option value="news">News</option>
+          <option value="event">Event</option>
+          <option value="holiday">Holiday</option>
+          <option value="exam">Exam Notice</option>
+        </select>
+      </div>
+      <div class="field"><label>Title</label><input type="text" id="event-title" placeholder="e.g. Tech Fest 2026"></div>
+      <div class="field"><label>Description</label><textarea id="event-desc" rows="4"></textarea></div>
+      <div class="grid cols-2">
+        <div class="field"><label>Venue (for events)</label><input type="text" id="event-venue"></div>
+        <div class="field"><label>Date</label><input type="date" id="event-date"></div>
+      </div>
+      <div class="field"><label>Event Poster (optional, image)</label><input type="file" id="event-poster" accept="image/*"></div>
+      <button class="btn gold" id="post-event-btn">Publish to Department</button>
+      <p class="stat-note" style="margin-top:10px;">This appears instantly on every student's and incharge's dashboard with a live notification.</p>
+    </div>
+    <h2 class="section-title">Previously Published</h2>
+    <div class="card">${events.map(eventItemSimple).join('') || '<p class="muted">Nothing published yet.</p>'}</div>
+  `;
+}
+
+function eventItemSimple(e) {
+  return `<div class="event-item"><div class="event-type">${e.type}</div><h4>${e.title}</h4><p>${e.description||''}</p>${e.venue?`<p class="muted" style="font-size:12px;">📍 ${e.venue} ${e.event_date?'· '+fmtDate(e.event_date):''}</p>`:''}<div class="event-date">Posted ${timeAgo(e.created_at)}</div></div>`;
+}
+
+function renderPresence() {
+  const withPresence = students.map(s => ({ ...s, presence: presenceByStudent[s.id] }));
+  const bySection = {};
+  withPresence.forEach(s => { (bySection[s.section] = bySection[s.section] || []).push(s); });
+  const sections = Object.keys(bySection).sort();
+  return `
+    <p class="stat-note" style="margin-bottom:14px;">Live, department-wide view of where students have marked themselves on campus. Updates automatically as students check in — no refresh needed.</p>
+    ${sections.map(sec => {
+      const rows = bySection[sec].slice().sort((a, b) => {
+        if (!a.presence) return 1;
+        if (!b.presence) return -1;
+        return new Date(b.presence.updated_at) - new Date(a.presence.updated_at);
+      });
+      return `
+        <h2 class="section-title">Section ${sec}</h2>
+        <div class="card">
+          <table>
+            <thead><tr><th>Roll No</th><th>Name</th><th>Current Location</th></tr></thead>
+            <tbody>${rows.map(s => `<tr><td class="mono">${s.roll_no}</td><td>${s.name}</td><td>${presenceBadgeHTML(s.presence)}</td></tr>`).join('')}</tbody>
+          </table>
+        </div>`;
+    }).join('') || '<div class="card"><p class="muted">No students in this department.</p></div>'}
+  `;
+}
+
+function renderReports() {
+  const withStats = students.map(s => ({ ...s, attendance: statsFor(s.id), marks: marksByStudent[s.id] || [] }));
+  return `
+    <div class="tabs">
+      <div class="tab active" data-report-tab="attendance">Attendance Report</div>
+      <div class="tab" data-report-tab="marks">Marks Report</div>
+      <div class="tab" data-report-tab="department">Department Report</div>
+    </div>
+    <div id="report-content">${reportTable('attendance', withStats)}</div>
+    <div class="form-row" style="margin-top:16px;">
+      <button class="btn small outline" id="export-csv-btn">📊 Export Excel (CSV)</button>
+      <button class="btn small outline" id="export-pdf-btn">🖨️ Export PDF</button>
+    </div>
+  `;
+}
+
+function reportTable(kind, withStats) {
+  if (kind === 'marks') {
+    return `<div class="card"><table><thead><tr><th>Roll No</th><th>Name</th><th>Section</th><th>Backlogs</th></tr></thead><tbody>
+      ${withStats.map(s => `<tr><td class="mono">${s.roll_no}</td><td>${s.name}</td><td>${s.section}</td><td>${s.marks.filter(m=>m.backlog).length}</td></tr>`).join('')}
+    </tbody></table></div>`;
+  }
+  if (kind === 'department') {
+    const bySection = {};
+    withStats.forEach(s => { (bySection[s.section] = bySection[s.section] || []).push(s); });
+    return `<div class="card"><table><thead><tr><th>Section</th><th>Students</th><th>Avg Attendance</th></tr></thead><tbody>
+      ${Object.keys(bySection).sort().map(sec => {
+        const list = bySection[sec];
+        const avg = Math.round(list.reduce((a,s)=>a+s.attendance.percentage,0)/list.length);
+        return `<tr><td>${sec}</td><td>${list.length}</td><td>${avg}%</td></tr>`;
+      }).join('')}
+    </tbody></table></div>`;
+  }
+  return `<div class="card"><table><thead><tr><th>Roll No</th><th>Name</th><th>Section</th><th>Attendance</th></tr></thead><tbody>
+    ${withStats.map(s => `<tr><td class="mono">${s.roll_no}</td><td>${s.name}</td><td>${s.section}</td><td>${s.attendance.percentage}%</td></tr>`).join('')}
+  </tbody></table></div>`;
+}
+
+function attachHandlers() {
+  document.querySelectorAll('[data-view-student]').forEach(btn => btn.addEventListener('click', () => { selectedStudentId = btn.dataset.viewStudent; renderView(); }));
+  const back = document.querySelector('[data-back]'); if (back) back.addEventListener('click', () => { selectedStudentId = null; renderView(); });
+  const searchInput = document.getElementById('student-search');
+  if (searchInput) searchInput.addEventListener('input', (e) => { searchTerm = e.target.value; renderView(); });
+
+  document.querySelectorAll('[data-delete-student]').forEach(btn => btn.addEventListener('click', async () => {
+    if (!confirm('Remove this student record? This cannot be undone.')) return;
+    try {
+      const { error } = await supabaseClient.from('profiles').delete().eq('id', btn.dataset.deleteStudent);
+      if (error) throw new Error(error.message);
+      toast('✅ Removed', 'Student record deleted.');
+      await loadAll();
+    } catch (e) { toast('❌ Error', e.message); }
+  }));
+
+  const addFacultyBtn = document.getElementById('add-faculty-btn');
+  if (addFacultyBtn) addFacultyBtn.addEventListener('click', async () => {
+    const name = document.getElementById('fac-name').value.trim();
+    const employee_id = document.getElementById('fac-empid').value.trim();
+    if (!name || !employee_id) { toast('⚠️ Missing info', 'Name and Employee ID required.'); return; }
+    try {
+      const { error } = await supabaseClient.from('faculty').insert({
+        name, employee_id, department: profile.department,
+        designation: document.getElementById('fac-designation').value.trim(),
+        phone: document.getElementById('fac-phone').value.trim(),
+        email: document.getElementById('fac-email').value.trim(),
+      });
+      if (error) throw new Error(error.message);
+      toast('✅ Added', `${name} added to faculty list.`);
+      await loadAll();
+    } catch (e) { toast('❌ Error', e.message); }
+  });
+
+  document.querySelectorAll('[data-delete-faculty]').forEach(btn => btn.addEventListener('click', async () => {
+    try { await supabaseClient.from('faculty').delete().eq('id', btn.dataset.deleteFaculty); toast('✅ Removed', ''); await loadAll(); }
+    catch (e) { toast('❌ Error', e.message); }
+  }));
+
+  const addTtBtn = document.getElementById('add-timetable-btn');
+  if (addTtBtn) addTtBtn.addEventListener('click', async () => {
+    try {
+      const { error } = await supabaseClient.from('timetable').insert({
+        department: profile.department,
+        section: document.getElementById('tt-section').value,
+        day: document.getElementById('tt-day').value,
+        period: parseInt(document.getElementById('tt-period').value),
+        time_slot: document.getElementById('tt-time').value.trim(),
+        subject: document.getElementById('tt-subject').value.trim(),
+        faculty_name: document.getElementById('tt-faculty').value.trim(),
+        room_number: document.getElementById('tt-room').value.trim(),
+      });
+      if (error) throw new Error(error.message);
+      toast('✅ Added', 'Timetable entry added.');
+      await loadAll();
+    } catch (e) { toast('❌ Error', e.message); }
+  });
+
+  document.querySelectorAll('[data-delete-tt]').forEach(btn => btn.addEventListener('click', async () => {
+    try { await supabaseClient.from('timetable').delete().eq('id', btn.dataset.deleteTt); toast('✅ Removed',''); await loadAll(); }
+    catch (e) { toast('❌ Error', e.message); }
+  }));
+
+  const addSubjBtn = document.getElementById('add-subject-btn');
+  if (addSubjBtn) addSubjBtn.addEventListener('click', async () => {
+    try {
+      const { error } = await supabaseClient.from('subjects').insert({
+        code: document.getElementById('subj-code').value.trim(),
+        name: document.getElementById('subj-name').value.trim(),
+        department: profile.department,
+        semester: parseInt(document.getElementById('subj-sem').value),
+        faculty_name: document.getElementById('subj-faculty').value.trim(),
+        credits: parseInt(document.getElementById('subj-credits').value) || 3,
+      });
+      if (error) throw new Error(error.message);
+      toast('✅ Added', 'Subject added.');
+      await loadAll();
+    } catch (e) { toast('❌ Error', e.message); }
+  });
+
+  document.querySelectorAll('[data-delete-subject]').forEach(btn => btn.addEventListener('click', async () => {
+    try { await supabaseClient.from('subjects').delete().eq('id', btn.dataset.deleteSubject); toast('✅ Removed',''); await loadAll(); }
+    catch (e) { toast('❌ Error', e.message); }
+  }));
+
+  const postEventBtn = document.getElementById('post-event-btn');
+  if (postEventBtn) postEventBtn.addEventListener('click', async () => {
+    const title = document.getElementById('event-title').value.trim();
+    if (!title) { toast('⚠️ Missing title', 'Please enter a title.'); return; }
+    postEventBtn.disabled = true; postEventBtn.textContent = 'Publishing...';
+    try {
+      let poster_url = null;
+      const file = document.getElementById('event-poster').files[0];
+      if (file) {
+        const path = `${Date.now()}_${file.name}`;
+        const { error: upErr } = await supabaseClient.storage.from('event-posters').upload(path, file);
+        if (upErr) throw new Error(upErr.message);
+        const { data: urlData } = supabaseClient.storage.from('event-posters').getPublicUrl(path);
+        poster_url = urlData.publicUrl;
+      }
+      const type = document.getElementById('event-type').value;
+      const { error } = await supabaseClient.from('events').insert({
+        title, description: document.getElementById('event-desc').value.trim(), type,
+        department: type === 'holiday' ? 'ALL' : profile.department,
+        venue: document.getElementById('event-venue').value.trim(),
+        event_date: document.getElementById('event-date').value || null,
+        poster_url, posted_by: profile.id,
+      });
+      if (error) throw new Error(error.message);
+      await pushNotification({ title, message: document.getElementById('event-desc').value.trim(), type, department: profile.department });
+      toast('✅ Published', 'Students and incharges will see this immediately.');
+      document.getElementById('event-title').value = ''; document.getElementById('event-desc').value = '';
+      await loadAll();
+    } catch (e) { toast('❌ Error', e.message); }
+    postEventBtn.disabled = false; postEventBtn.textContent = 'Publish to Department';
+  });
+
+  document.querySelectorAll('[data-report-tab]').forEach(tab => tab.addEventListener('click', () => {
+    document.querySelectorAll('[data-report-tab]').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const withStats = students.map(s => ({ ...s, attendance: statsFor(s.id), marks: marksByStudent[s.id] || [] }));
+    document.getElementById('report-content').innerHTML = reportTable(tab.dataset.reportTab, withStats);
+  }));
+
+  const exportCsvBtn = document.getElementById('export-csv-btn');
+  if (exportCsvBtn) exportCsvBtn.addEventListener('click', () => {
+    const withStats = students.map(s => ({ ...s, attendance: statsFor(s.id) }));
+    exportToCSV(`${profile.department}_department_report.csv`, ['Roll No','Name','Section','Attendance %'],
+      withStats.map(s => [s.roll_no, s.name, s.section, s.attendance.percentage]));
+  });
+
+  const exportPdfBtn = document.getElementById('export-pdf-btn');
+  if (exportPdfBtn) exportPdfBtn.addEventListener('click', () => {
+    const withStats = students.map(s => ({ ...s, attendance: statsFor(s.id) }));
+    const rows = withStats.map(s => `<tr><td>${s.roll_no}</td><td>${s.name}</td><td>${s.section}</td><td>${s.attendance.percentage}%</td></tr>`).join('');
+    printReport(`${profile.department} Department Report`, `<table><tr><th>Roll No</th><th>Name</th><th>Section</th><th>Attendance</th></tr>${rows}</table>`);
+  });
+
+  const deptChartCanvas = document.getElementById('dept-chart');
+  if (deptChartCanvas) {
+    const withStats = students.map(s => ({ ...s, attendance: statsFor(s.id) }));
+    const sections = {};
+    withStats.forEach(s => { (sections[s.section] = sections[s.section] || []).push(s); });
+    const labels = Object.keys(sections).sort();
+    const values = labels.map(sec => Math.round(sections[sec].reduce((a,s)=>a+s.attendance.percentage,0)/sections[sec].length));
+    if (labels.length) drawBarChart(deptChartCanvas, labels.map(l=>'Sec '+l), values);
+  }
+}
+
+init();
+</script>
+</body>
+</html>
