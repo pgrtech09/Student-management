@@ -351,10 +351,59 @@ function messageBubbleHTML(m, isMine) {
 
 const PRESENCE_OPTIONS = ['Library', 'Lab', 'Classroom', 'Canteen', 'Ground', 'Auditorium', 'Other'];
 
+// Haversine formula — straight-line distance in meters between two lat/lng points.
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+function campusCoordsConfigured() {
+  return !(CAMPUS_LATITUDE === 0 && CAMPUS_LONGITUDE === 0);
+}
+
+// Requests the device's current GPS position (same pattern as the existing
+// campus check-in feature). Resolves to {latitude, longitude} or null if
+// denied/unavailable — this function never rejects, so callers don't need
+// try/catch just to handle "no GPS."
+function getDeviceLocation() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) { resolve(null); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+      () => resolve(null),
+      { timeout: 8000 }
+    );
+  });
+}
+
+// Sets a student's presence, verifying it against the campus GPS coordinates
+// in config.js. Returns the record that was saved, including whether it was
+// GPS-verified, so the caller can show the right message.
 async function setMyPresence(studentId, location) {
-  const { error } = await supabaseClient.from('student_presence')
-    .upsert({ student_id: studentId, location, updated_at: new Date().toISOString() }, { onConflict: 'student_id' });
+  const coords = await getDeviceLocation();
+  let verified = false;
+  let distance = null;
+  let latitude = null, longitude = null;
+
+  if (coords) {
+    latitude = coords.latitude;
+    longitude = coords.longitude;
+    if (campusCoordsConfigured()) {
+      distance = Math.round(distanceMeters(latitude, longitude, CAMPUS_LATITUDE, CAMPUS_LONGITUDE));
+      verified = distance <= CAMPUS_RADIUS_METERS;
+    } else {
+      console.warn('Campus coordinates are not configured in config.js — presence will be recorded but never shown as GPS-verified. See the comment above CAMPUS_LATITUDE.');
+    }
+  }
+
+  const record = { student_id: studentId, location, latitude, longitude, verified, distance_meters: distance, updated_at: new Date().toISOString() };
+  const { error } = await supabaseClient.from('student_presence').upsert(record, { onConflict: 'student_id' });
   if (error) throw new Error(error.message);
+  return record;
 }
 
 async function fetchPresenceMap(studentIds) {
@@ -378,5 +427,11 @@ function subscribeToPresence(profile, onChange) {
 function presenceBadgeHTML(presence) {
   if (!presence) return '<span class="pill" style="background:var(--border);color:var(--text-muted);">Unknown</span>';
   const stale = (Date.now() - new Date(presence.updated_at).getTime()) > 2 * 60 * 60 * 1000; // 2 hours
-  return `<span class="pill ${stale ? '' : 'present'}" style="${stale ? 'background:var(--border);color:var(--text-muted);' : ''}">${presence.location}${stale ? ' (stale)' : ''}</span> <span class="muted" style="font-size:11px;">${timeAgo(presence.updated_at)}</span>`;
+  const locLabel = stale ? `${presence.location} (stale)` : presence.location;
+  const pillClass = stale ? '' : (presence.verified ? 'present' : 'pending');
+  const pillStyle = stale ? 'background:var(--border);color:var(--text-muted);' : '';
+  const verifyTag = stale ? '' : (presence.verified
+    ? ' <span title="GPS confirmed on campus">📍✓</span>'
+    : ' <span title="Not GPS-verified — either location was denied, or the device reported a spot outside campus" style="color:var(--pending);">⚠ unverified</span>');
+  return `<span class="pill ${pillClass}" style="${pillStyle}">${locLabel}</span>${verifyTag} <span class="muted" style="font-size:11px;">${timeAgo(presence.updated_at)}</span>`;
 }
